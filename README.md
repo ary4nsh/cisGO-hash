@@ -1,0 +1,1 @@
+This is a tool written in golang that analyzes some Cisco protocols and prints some important data fields of the packets, like protocol version, source and destination IP and MAC addresses, authentication type and in case of available authentication, authentication data (like plain-text string or md5/sha hashes).
