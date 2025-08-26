@@ -11,8 +11,6 @@ import (
 )
 
 func ExtractOSPFFromPcapng(filename string) error {
-	fmt.Printf("Starting to analyze file: %s\n", filename)
-	
 	// Create or open the hash file for writing
 	hashFile, err := os.Create("ospf-hashes.txt")
 	if err != nil {
@@ -29,7 +27,6 @@ func ExtractOSPFFromPcapng(filename string) error {
 	}
 	defer handle.Close()
 
-	fmt.Println("File opened successfully, reading packets...")
 	
 	// Create packet source
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
