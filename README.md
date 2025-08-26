@@ -13,6 +13,7 @@ Usage:
 Flags:
       --capture string   Path to the capture file (pcap/pcapng/cap)
       --eigrp            Analyze EIGRP packets
+      --glbp             Analyze GLBP packets
   -h, --help             help for cisGO-hash
       --hsrp             Analyze HSRP packets
       --ospf             Analyze OSPF packets
