@@ -23,11 +23,16 @@ type EIGRPPacket struct {
 	VirtualRouterID  uint16
 	AutonomousSystem uint16
 	AuthType         string
+	AuthTypeCode     uint8
 	AuthLength       uint16
 	Digest           string
 	KValues          []uint8
 	HasKValues       bool
 	IsIPv6           bool
+	RawPayload       []byte
+	AuthTLVData      []byte
+	ExtraSalt        []byte
+	HasExtraSalt     bool
 }
 
 // ExtractEIGRPFromPcap analyzes EIGRP packets from capture files
@@ -64,6 +69,7 @@ func ExtractEIGRPFromPcap(filename string) {
 
 func processEIGRPFromNgReader(reader *pcapgo.NgReader) {
 	var eigrpPackets []EIGRPPacket
+	var hashLines []string
 	totalPackets := 0
 	packetNum := 1
 	
@@ -79,16 +85,28 @@ func processEIGRPFromNgReader(reader *pcapgo.NgReader) {
 		if eigrpPacket := extractEIGRPInfo(packet); eigrpPacket != nil {
 			fmt.Printf("=== EIGRP Packet #%d ===\n", packetNum)
 			printEIGRPPacket(*eigrpPacket)
+			
+			// Generate custom format and add to hash lines
+			hashLine := generateCustomFormat(*eigrpPacket, packetNum)
+			if hashLine != "" {
+				fmt.Printf("%s\n", hashLine)
+				hashLines = append(hashLines, hashLine)
+			}
+			
 			eigrpPackets = append(eigrpPackets, *eigrpPacket)
 			packetNum++
 		}
 	}
 	
 	printEIGRPSummary(totalPackets, len(eigrpPackets))
+	
+	// Write hash lines to file after summary
+	writeHashesToFile(hashLines)
 }
 
 func processEIGRPFromHandle(handle *pcap.Handle) {
 	var eigrpPackets []EIGRPPacket
+	var hashLines []string
 	totalPackets := 0
 	packetNum := 1
 	
@@ -99,12 +117,23 @@ func processEIGRPFromHandle(handle *pcap.Handle) {
 		if eigrpPacket := extractEIGRPInfo(packet); eigrpPacket != nil {
 			fmt.Printf("=== EIGRP Packet #%d ===\n", packetNum)
 			printEIGRPPacket(*eigrpPacket)
+			
+			// Generate custom format and add to hash lines
+			hashLine := generateCustomFormat(*eigrpPacket, packetNum)
+			if hashLine != "" {
+				fmt.Printf("%s\n", hashLine)
+				hashLines = append(hashLines, hashLine)
+			}
+			
 			eigrpPackets = append(eigrpPackets, *eigrpPacket)
 			packetNum++
 		}
 	}
 	
 	printEIGRPSummary(totalPackets, len(eigrpPackets))
+	
+	// Write hash lines to file after summary
+	writeHashesToFile(hashLines)
 }
 
 func extractEIGRPInfo(packet gopacket.Packet) *EIGRPPacket {
@@ -119,11 +148,13 @@ func extractEIGRPInfo(packet gopacket.Packet) *EIGRPPacket {
 		}
 		
 		eigrpPacket = &EIGRPPacket{
-			SrcIP:      ip.SrcIP.String(),
-			DstIP:      ip.DstIP.String(),
-			AuthType:   "Not present",
-			IsIPv6:     false,
-			HasKValues: false,
+			SrcIP:         ip.SrcIP.String(),
+			DstIP:         ip.DstIP.String(),
+			AuthType:      "Not present",
+			AuthTypeCode:  0,
+			IsIPv6:        false,
+			HasKValues:    false,
+			HasExtraSalt:  false,
 		}
 		payload = ip.Payload
 	} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
@@ -134,11 +165,13 @@ func extractEIGRPInfo(packet gopacket.Packet) *EIGRPPacket {
 		}
 		
 		eigrpPacket = &EIGRPPacket{
-			SrcIP:      ipv6.SrcIP.String(),
-			DstIP:      ipv6.DstIP.String(),
-			AuthType:   "Not present",
-			IsIPv6:     true,
-			HasKValues: false,
+			SrcIP:         ipv6.SrcIP.String(),
+			DstIP:         ipv6.DstIP.String(),
+			AuthType:      "Not present",
+			AuthTypeCode:  0,
+			IsIPv6:        true,
+			HasKValues:    false,
+			HasExtraSalt:  false,
 		}
 		payload = ipv6.Payload
 	} else {
@@ -152,18 +185,12 @@ func extractEIGRPInfo(packet gopacket.Packet) *EIGRPPacket {
 		eigrpPacket.DstMAC = eth.DstMAC.String()
 	}
 	
+	// Store raw payload for processing
+	eigrpPacket.RawPayload = make([]byte, len(payload))
+	copy(eigrpPacket.RawPayload, payload)
+	
 	// Extract EIGRP-specific information from payload
 	if len(payload) >= 20 { // Minimum EIGRP header size
-		// EIGRP Header structure:
-		// Version (1 byte)
-		// Opcode (1 byte) 
-		// Checksum (2 bytes)
-		// Flags (4 bytes)
-		// Sequence (4 bytes)
-		// Acknowledgment (4 bytes)
-		// Virtual Router ID (2 bytes) - often called Process ID
-		// Autonomous System (2 bytes)
-		
 		eigrpPacket.Version = payload[0]
 		
 		if len(payload) >= 20 {
@@ -182,7 +209,27 @@ func extractEIGRPInfo(packet gopacket.Packet) *EIGRPPacket {
 
 func parseEIGRPTLVs(tlvData []byte, eigrpPacket *EIGRPPacket) {
 	offset := 0
+	authTLVEnd := -1
 	
+	// First pass: find authentication TLV and its end position
+	tempOffset := 0
+	for tempOffset+4 <= len(tlvData) {
+		tlvType := binary.BigEndian.Uint16(tlvData[tempOffset:tempOffset+2])
+		tlvLength := binary.BigEndian.Uint16(tlvData[tempOffset+2:tempOffset+4])
+		
+		if tlvLength < 4 || tempOffset+int(tlvLength) > len(tlvData) {
+			break
+		}
+		
+		if tlvType == 0x0002 { // Authentication TLV
+			authTLVEnd = tempOffset + int(tlvLength)
+			break
+		}
+		
+		tempOffset += int(tlvLength)
+	}
+	
+	// Second pass: process TLVs and collect extra salt
 	for offset+4 <= len(tlvData) {
 		tlvType := binary.BigEndian.Uint16(tlvData[offset:offset+2])
 		tlvLength := binary.BigEndian.Uint16(tlvData[offset+2:offset+4])
@@ -196,14 +243,6 @@ func parseEIGRPTLVs(tlvData []byte, eigrpPacket *EIGRPPacket) {
 		switch tlvType {
 		case 0x0001: // Parameters TLV - contains K values
 			if len(tlvValue) >= 6 {
-				// Parameters TLV structure:
-				// K1 (1 byte)
-				// K2 (1 byte) 
-				// K3 (1 byte)
-				// K4 (1 byte)
-				// K5 (1 byte)
-				// K6 (1 byte)
-				// Hold Time (2 bytes)
 				eigrpPacket.KValues = []uint8{
 					tlvValue[0], // K1
 					tlvValue[1], // K2
@@ -214,11 +253,25 @@ func parseEIGRPTLVs(tlvData []byte, eigrpPacket *EIGRPPacket) {
 				}
 				eigrpPacket.HasKValues = true
 			}
+			
 		case 0x0002: // Authentication TLV
 			parseAuthenticationTLV(tlvValue, eigrpPacket)
+			// Store auth TLV data for building packet data
+			eigrpPacket.AuthTLVData = make([]byte, int(tlvLength))
+			copy(eigrpPacket.AuthTLVData, tlvData[offset:offset+int(tlvLength)])
 		}
 		
 		offset += int(tlvLength)
+	}
+	
+	// Check if there's data after authentication digest and collect it as extra salt
+	if authTLVEnd > 0 && authTLVEnd < len(tlvData) {
+		extraData := tlvData[authTLVEnd:]
+		if len(extraData) > 0 {
+			eigrpPacket.ExtraSalt = make([]byte, len(extraData))
+			copy(eigrpPacket.ExtraSalt, extraData)
+			eigrpPacket.HasExtraSalt = true
+		}
 	}
 }
 
@@ -227,18 +280,11 @@ func parseAuthenticationTLV(authData []byte, eigrpPacket *EIGRPPacket) {
 		return
 	}
 	
-	// Authentication TLV structure:
-	// Auth Type (2 bytes) - 2=MD5, 3=SHA256
-	// Auth Length (2 bytes) - length of digest
-	// Key ID (2 bytes)
-	// Key Sequence (4 bytes)  
-	// Null pad (8 bytes)
-	// Digest (variable length based on auth length)
-	
 	authType := binary.BigEndian.Uint16(authData[0:2])
 	authLength := binary.BigEndian.Uint16(authData[2:4])
 	
 	eigrpPacket.AuthLength = authLength
+	eigrpPacket.AuthTypeCode = uint8(authType)
 	
 	switch authType {
 	case 2:
@@ -250,12 +296,114 @@ func parseAuthenticationTLV(authData []byte, eigrpPacket *EIGRPPacket) {
 	}
 	
 	// Extract digest based on the authentication length
-	// The digest starts after: Auth Type (2) + Auth Length (2) + Key ID (4) + Key Sequence (4) + Null pad (8) = 20 bytes
 	digestOffset := 20
 	if len(authData) >= digestOffset+int(authLength) {
 		digest := authData[digestOffset : digestOffset+int(authLength)]
 		eigrpPacket.Digest = fmt.Sprintf("%x", digest)
 	}
+}
+
+func generateCustomFormat(packet EIGRPPacket, packetIndex int) string {
+	// Only generate if we have authentication
+	if packet.AuthTypeCode == 0 {
+		return ""
+	}
+	
+	// Build the packet data with zeroed checksum
+	packetData := buildPacketDataWithZeroedChecksum(packet)
+	
+	// Determine extra salt flag and data based on data after authentication digest
+	extraSaltFlag := "0"
+	extraSaltData := ""
+	if packet.HasExtraSalt {
+		extraSaltFlag = "1"
+		extraSaltData = fmt.Sprintf("%x", packet.ExtraSalt)
+	}
+	
+	// Return the formatted string
+	return fmt.Sprintf("%d:$eigrp$%d$%s$%s$%s$1$%s$%s\n",
+		packetIndex,
+		packet.AuthTypeCode,
+		packetData,
+		extraSaltFlag,
+		extraSaltData,
+		packet.SrcIP,
+		packet.Digest)
+}
+
+func writeHashesToFile(hashLines []string) {
+	if len(hashLines) == 0 {
+		return
+	}
+	
+	file, err := os.Create("eigrp-hashes.txt")
+	if err != nil {
+		log.Printf("Error creating eigrp-hashes.txt: %v", err)
+		return
+	}
+	defer file.Close()
+	
+	for _, line := range hashLines {
+		_, err := file.WriteString(line + "\n")
+		if err != nil {
+			log.Printf("Error writing to file: %v", err)
+			return
+		}
+	}
+	
+	fmt.Printf("Hash lines written to eigrp-hashes.txt (%d lines)\n", len(hashLines))
+}
+
+func buildPacketDataWithZeroedChecksum(packet EIGRPPacket) string {
+	if len(packet.RawPayload) < 20 {
+		return ""
+	}
+	
+	// Create a copy of the payload to modify
+	data := make([]byte, len(packet.RawPayload))
+	copy(data, packet.RawPayload)
+	
+	// Zero out the checksum at offset 2-3 (2 bytes)
+	data[2] = 0x00
+	data[3] = 0x00
+	
+	// Find the digest offset in the authentication TLV and calculate data up to digest
+	digestOffset := findDigestOffset(data)
+	if digestOffset == -1 {
+		return fmt.Sprintf("%x", data)
+	}
+	
+	// Return hex string from offset 0 until digest (excluding digest)
+	return fmt.Sprintf("%x", data[:digestOffset])
+}
+
+func findDigestOffset(data []byte) int {
+	if len(data) < 20 {
+		return -1
+	}
+	
+	// Start parsing TLVs at offset 20
+	offset := 20
+	
+	for offset+4 <= len(data) {
+		tlvType := binary.BigEndian.Uint16(data[offset:offset+2])
+		tlvLength := binary.BigEndian.Uint16(data[offset+2:offset+4])
+		
+		if tlvLength < 4 || offset+int(tlvLength) > len(data) {
+			break
+		}
+		
+		// If this is an authentication TLV (0x0002)
+		if tlvType == 0x0002 {
+			// Digest starts at: TLV header (4) + Auth Type (2) + Auth Length (2) + Key ID (2) + Key Sequence (4) + Null pad (8) = 22 bytes into TLV
+			digestStart := offset + 4 + 20 // TLV header + auth header
+			return digestStart
+		}
+		
+		offset += int(tlvLength)
+	}
+	
+	return -1
 }
 
 func printEIGRPPacket(packet EIGRPPacket) {
