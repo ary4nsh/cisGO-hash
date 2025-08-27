@@ -1,6 +1,7 @@
 # cisGO-hash
 
 This is a tool written in golang that analyzes Hello packets in some Cisco protocols and prints some important data fields of the packets, like protocol version, source and destination IP and MAC addresses, authentication type and in case of available authentication, authentication data (like plain-text string or md5/sha hashes).
+
 For the authentication present in OSPF and EIGRP (which is mostly MD5), this tool prints the packet data in the corresponding text file of the protocol in a format that the tool John the Ripper can crack.
 
 ## Usage
