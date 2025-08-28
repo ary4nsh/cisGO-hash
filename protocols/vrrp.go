@@ -20,18 +20,20 @@ type VRRPPacket struct {
 	SrcMAC           string
 	DstMAC           string
 	Version          uint8
+	Type             uint8
 	VirtualRouterID  uint8
 	Priority         uint8
 	AuthType         string
 	AuthString       string
 	MD5AuthData      string
 	VirtualAddresses []string
+	RawPayload       []byte // Store raw payload for hash generation
 }
 
 // VRRP authentication type constants
 var vrrpAuthTypes = map[uint8]string{
-	0: "No authentication",
-	1: "Plain-text",
+	0:   "No authentication",
+	1:   "Plain-text",
 	254: "MD5",
 }
 
@@ -69,8 +71,9 @@ func ExtractVRRPFromPcap(filename string) {
 
 func processVRRPFromNgReader(reader *pcapgo.NgReader) {
 	var vrrpPackets []VRRPPacket
+	var hashLines []string
 	totalPackets := 0
-	packetNum := 1
+	vrrpPacketNum := 1
 	
 	for {
 		data, _, err := reader.ReadPacketData()
@@ -82,34 +85,69 @@ func processVRRPFromNgReader(reader *pcapgo.NgReader) {
 		packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
 		
 		if vrrpPacket := extractVRRPInfo(packet); vrrpPacket != nil {
-			fmt.Printf("=== VRRP Packet #%d ===\n", packetNum)
+			fmt.Printf("=== VRRP Packet #%d ===\n", vrrpPacketNum)
+			
+			// Check version and type requirements
+			if vrrpPacket.Version != 2 || vrrpPacket.Type != 1 {
+				fmt.Printf("Unsupported VRRP packet version %d or type %d, packet # %d\n", 
+					vrrpPacket.Version, vrrpPacket.Type, vrrpPacketNum)
+				fmt.Println()
+				vrrpPacketNum++
+				continue
+			}
+			
 			printVRRPPacket(*vrrpPacket)
+			
+			// Generate hash line if MD5 authentication - use totalPackets as index
+			if hashLine := generateMD5HashLine(*vrrpPacket, totalPackets); hashLine != "" {
+				hashLines = append(hashLines, hashLine)
+				fmt.Printf("%s\n", hashLine)
+			}
+			
 			vrrpPackets = append(vrrpPackets, *vrrpPacket)
-			packetNum++
+			vrrpPacketNum++
 		}
 	}
 	
-	printVRRPSummary(totalPackets, len(vrrpPackets))
+	printVRRPSummary(totalPackets, len(vrrpPackets), hashLines)
 }
 
 func processVRRPFromHandle(handle *pcap.Handle) {
 	var vrrpPackets []VRRPPacket
+	var hashLines []string
 	totalPackets := 0
-	packetNum := 1
+	vrrpPacketNum := 1
 	
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
 		totalPackets++
 		
 		if vrrpPacket := extractVRRPInfo(packet); vrrpPacket != nil {
-			fmt.Printf("=== VRRP Packet #%d ===\n", packetNum)
+			fmt.Printf("=== VRRP Packet #%d ===\n", vrrpPacketNum)
+			
+			// Check version and type requirements
+			if vrrpPacket.Version != 2 || vrrpPacket.Type != 1 {
+				fmt.Printf("Unsupported VRRP packet version %d or type %d, packet # %d\n", 
+					vrrpPacket.Version, vrrpPacket.Type, vrrpPacketNum)
+				fmt.Println()
+				vrrpPacketNum++
+				continue
+			}
+			
 			printVRRPPacket(*vrrpPacket)
+			
+			// Generate hash line if MD5 authentication - use totalPackets as index
+			if hashLine := generateMD5HashLine(*vrrpPacket, totalPackets); hashLine != "" {
+				hashLines = append(hashLines, hashLine)
+				fmt.Printf("%s\n", hashLine)
+			}
+			
 			vrrpPackets = append(vrrpPackets, *vrrpPacket)
-			packetNum++
+			vrrpPacketNum++
 		}
 	}
 	
-	printVRRPSummary(totalPackets, len(vrrpPackets))
+	printVRRPSummary(totalPackets, len(vrrpPackets), hashLines)
 }
 
 func extractVRRPInfo(packet gopacket.Packet) *VRRPPacket {
@@ -121,9 +159,13 @@ func extractVRRPInfo(packet gopacket.Packet) *VRRPPacket {
 		}
 		
 		vrrpPacket := &VRRPPacket{
-			SrcIP: ip.SrcIP.String(),
-			DstIP: ip.DstIP.String(),
+			SrcIP:      ip.SrcIP.String(),
+			DstIP:      ip.DstIP.String(),
+			RawPayload: make([]byte, len(ip.Payload)),
 		}
+		
+		// Store raw payload for hash generation
+		copy(vrrpPacket.RawPayload, ip.Payload)
 		
 		// Extract MAC addresses
 		if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
@@ -161,6 +203,7 @@ func parseVRRPPayload(payload []byte, vrrpPacket *VRRPPacket) {
 	
 	// VRRP fixed header
 	vrrpPacket.Version = (payload[0] >> 4) & 0x0F
+	vrrpPacket.Type = payload[0] & 0x0F
 	vrrpPacket.VirtualRouterID = payload[1]
 	vrrpPacket.Priority = payload[2]
 	authTypeValue := payload[4]
@@ -209,6 +252,31 @@ func parseVRRPPayload(payload []byte, vrrpPacket *VRRPPacket) {
 	}
 }
 
+func generateMD5HashLine(packet VRRPPacket, index int) string {
+	// Only generate hash line for MD5 authentication (254)
+	if packet.AuthType != "MD5" || packet.MD5AuthData == "" {
+		return ""
+	}
+	
+	if len(packet.RawPayload) < 20 {
+		return ""
+	}
+	
+	// Create a copy of the first 20 bytes with checksum zeroed
+	first20Bytes := make([]byte, 20)
+	copy(first20Bytes, packet.RawPayload[:20])
+	
+	// Zero out checksum at offset 6-7
+	first20Bytes[6] = 0
+	first20Bytes[7] = 0
+	
+	// Convert first 20 bytes to hex string
+	first20Hex := fmt.Sprintf("%x", first20Bytes)
+	
+	// Format: [index]:$hsrp$[first20bytes]$[digest]
+	return fmt.Sprintf("%d:$hsrp$%s$%s\n", index, first20Hex, packet.MD5AuthData)
+}
+
 func printVRRPPacket(packet VRRPPacket) {
 	fmt.Printf("- Source address: %s\n", packet.SrcIP)
 	fmt.Printf("- Destination address: %s\n", packet.DstIP)
@@ -242,8 +310,22 @@ func printVRRPPacket(packet VRRPPacket) {
 	fmt.Println()
 }
 
-func printVRRPSummary(totalPackets, vrrpPackets int) {
+func printVRRPSummary(totalPackets, vrrpPackets int, hashLines []string) {
 	fmt.Println("=== SUMMARY ===")
 	fmt.Printf("Total packets processed: %d\n", totalPackets)
 	fmt.Printf("VRRP packets found: %d\n", vrrpPackets)
+	
+	if len(hashLines) > 0 {
+		// Write hash lines to file
+		file, err := os.Create("vrrp-hashes.txt")
+		if err != nil {
+			log.Printf("Error creating hash file: %v\n", err)
+		} else {
+			defer file.Close()
+			for _, line := range hashLines {
+				file.WriteString(line + "\n")
+			}
+			fmt.Printf("Hash lines written to vrrp-hashes.txt (%d lines)\n", len(hashLines))
+		}
+	}
 }
