@@ -280,7 +280,7 @@ func parseOSPFv2Packet(packet gopacket.Packet, ip *layers.IPv4, packetNum int) [
 	fmt.Println()
 	
 	// Generate netmd5 hash format for MD5 authentication
-	if authType == 2 && len(authData) == int(authDataLength) && msgType == 1 && authDataLength > 0 {
+	if authType == 2 && len(authData) == int(authDataLength) && msgType == 1 && authDataLength == 16 {
 		// Extract OSPF header + Hello packet (without the MD5 hash)
 		ospfPacketData := payload[:packetLength]
 		netmd5Hash := fmt.Sprintf("$netmd5$%x$%x", ospfPacketData, authData)
